@@ -1,4 +1,5 @@
 import re
+import math
 import streamlit as st
 import pandas as pd
 
@@ -543,6 +544,47 @@ gain = {r: recycled_total[r] - lost_total[r] for r in ["M","C","D"]}
 
 due_hybrid = {p: {r: (gain[r] * shares[p]) + lost_res[p][r] - recycled[p][r] for r in ["M","C","D"]} for p in players}
 
+
+# --- Trasporti necessari per la ridistribuzione ---
+st.subheader("5) Trasporti necessari (post-raccolta)")
+st.caption("Calcolo dei carichi necessari per trasferire le risorse tra i giocatori in base alla spartizione finale.")
+
+with st.expander("🚚 Impostazioni trasporti", expanded=True):
+    colA, colB = st.columns(2)
+    with colA:
+        cargo_type = st.selectbox(
+            "Tipo di nave da trasporto",
+            ["Cargo Leggero (5.000)", "Cargo Pesante (25.000)"],
+            index=1,
+        )
+    with colB:
+        st.caption("Capacità standard OGame, senza bonus tecnologia.")
+
+cargo_capacity = 5000 if "Leggero" in cargo_type else 25000
+
+# Calcolo risorse nette per giocatore
+net = {p: {r: round(due_hybrid[p][r]) for r in ["M","C","D"]} for p in players}
+
+# Totale da spedire per chi deve dare (valori negativi)
+rows_t = []
+for p in players:
+    give = sum(-v for v in net[p].values() if v < 0)
+    receive = sum(v for v in net[p].values() if v > 0)
+    ships_needed = math.ceil(max(give, receive) / cargo_capacity) if max(give, receive) > 0 else 0
+    rows_t.append({
+        "Giocatore": p,
+        "Deve dare (tot risorse)": give,
+        "Deve ricevere (tot risorse)": receive,
+        "Capacità nave": cargo_capacity,
+        "Trasporti minimi": ships_needed,
+    })
+
+transport_df = pd.DataFrame(rows_t)
+
+st.dataframe(transport_df, use_container_width=True)
+st.caption("Nota: il numero di trasporti è una stima minima (carichi ottimizzati, senza vuoti).")
+
+
 st.subheader("Risultati")
 
 rows = []
@@ -576,5 +618,101 @@ with c2:
 
 st.caption("Interpretazione: valori **positivi** in 'Ibrida' = risorse che il giocatore deve ricevere; valori **negativi** = risorse che deve trasferire agli altri.")
 
+# ----------------------------
+# Trasferimenti consigliati (per ridistribuire dopo le raccolte)
+# ----------------------------
+def settle_transactions(amounts_by_player: dict):
+    """
+    amounts_by_player: {player: amount} dove:
+      >0 = deve ricevere
+      <0 = deve dare
+    Ritorna lista transazioni: (da, a, amount)
+    """
+    eps = 0.5  # tolleranza arrotondamenti
+    creditors = [(p, v) for p, v in amounts_by_player.items() if v > eps]
+    debtors = [(p, -v) for p, v in amounts_by_player.items() if v < -eps]  # amount to pay (positive)
+    creditors.sort(key=lambda x: x[1], reverse=True)
+    debtors.sort(key=lambda x: x[1], reverse=True)
+
+    tx = []
+    i = j = 0
+    while i < len(debtors) and j < len(creditors):
+        dp, damt = debtors[i]
+        cp, camt = creditors[j]
+        send = min(damt, camt)
+        if send > eps:
+            tx.append((dp, cp, send))
+        damt -= send
+        camt -= send
+        debtors[i] = (dp, damt)
+        creditors[j] = (cp, camt)
+        if damt <= eps:
+            i += 1
+        if camt <= eps:
+            j += 1
+    return tx
+
+def ceil_div(a, b):
+    return int(math.ceil(a / b)) if b > 0 else 0
+
+with st.expander("🚚 Trasporti necessari per ridistribuire (calcolati dai saldi Ibridi)", expanded=True):
+    st.caption(
+        "Calcolo automatico dei **trasferimenti** tra membri per azzerare i saldi. "
+        "Le transazioni sono calcolate separatamente per M/C/D e poi aggregate per coppia (da→a)."
+    )
+
+    cap_choice = st.selectbox(
+        "Tipo trasporto per stimare le navi necessarie",
+        ["Cargo. L (5.000)", "Cargo. P (25.000)"],
+        index=1,
+    )
+    capacity = 5000 if "5.000" in cap_choice else 25000
+
+    # Transazioni per risorsa
+    tx_by_res = {}
+    for r in ["M", "C", "D"]:
+        amounts = {p: float(due_hybrid[p][r]) for p in players}
+        tx_by_res[r] = settle_transactions(amounts)
+
+    # Aggrega per coppia (da,a)
+    agg = {}
+    for r in ["M", "C", "D"]:
+        for frm, to, amt in tx_by_res[r]:
+            key = (frm, to)
+            agg.setdefault(key, {"M": 0.0, "C": 0.0, "D": 0.0})
+            agg[key][r] += amt
+
+    # Tabella finale
+    tx_rows = []
+    for (frm, to), v in agg.items():
+        total_payload = v["M"] + v["C"] + v["D"]
+        ships = ceil_div(total_payload, capacity)
+        tx_rows.append({
+            "Da": frm,
+            "A": to,
+            "Metallo": int(round(v["M"])),
+            "Cristallo": int(round(v["C"])),
+            "Deuterio": int(round(v["D"])),
+            "Totale carico": int(round(total_payload)),
+            f"N° {cap_choice.split()[0]}": ships,
+        })
+    tx_df = pd.DataFrame(tx_rows).sort_values(["Da","A"]) if tx_rows else pd.DataFrame(columns=["Da","A","Metallo","Cristallo","Deuterio","Totale carico", f"N° {cap_choice.split()[0]}"])
+
+    if tx_df.empty:
+        st.info("Non risultano trasferimenti (tutti i saldi sono ~0).")
+    else:
+        st.dataframe(tx_df, use_container_width=True)
+
+        # Dettaglio per risorsa (opzionale)
+        with st.expander("Dettaglio transazioni per singola risorsa", expanded=False):
+            for r, label in [("M","Metallo"),("C","Cristallo"),("D","Deuterio")]:
+                st.markdown(f"**{label}**")
+                rows_r = [{"Da": a, "A": b, label: int(round(v))} for a,b,v in tx_by_res[r]]
+                st.dataframe(pd.DataFrame(rows_r) if rows_r else pd.DataFrame(columns=["Da","A",label]), use_container_width=True)
+
+        csv_tx = tx_df.to_csv(index=False).encode("utf-8")
+        st.download_button("⬇️ Scarica trasporti (CSV)", data=csv_tx, file_name="trasporti_ridistribuzione.csv", mime="text/csv")
+
+# Export CSV risultati
 csv = out_df.to_csv(index=False).encode("utf-8")
 st.download_button("⬇️ Scarica risultati (CSV)", data=csv, file_name="spartizione_detriti_risultati.csv", mime="text/csv")
