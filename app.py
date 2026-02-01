@@ -1,7 +1,10 @@
 import re
 import math
+import html
+import xml.etree.ElementTree as ET
 import streamlit as st
 import pandas as pd
+import requests
 
 st.set_page_config(page_title="Spartizione Detriti (OGame)", layout="wide")
 
@@ -315,6 +318,26 @@ def parse_cr(text: str):
 
     return fleets, meta
 
+def _clean_cr_html(raw: str) -> str:
+    cleaned = raw.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
+    cleaned = re.sub(r"<[^>]+>", "", cleaned)
+    cleaned = html.unescape(cleaned)
+    return cleaned.strip()
+
+def fetch_cr_from_api(url: str) -> str:
+    response = requests.get(url, timeout=15)
+    response.raise_for_status()
+    content = response.text
+    try:
+        root = ET.fromstring(content)
+    except ET.ParseError:
+        return _clean_cr_html(content)
+
+    report_el = root.find(".//report")
+    if report_el is None:
+        return _clean_cr_html(content)
+    return _clean_cr_html(report_el.text or "")
+
 st.title("Spartizione detriti (OGame) — logica come l'Excel")
 
 with st.expander("🔧 Impostazioni", expanded=True):
@@ -343,6 +366,27 @@ for i in range(int(n_players)):
 # --- CR Paste helper ---
 st.subheader("0) (Opzionale) Incolla Combat Report per auto-compilare")
 st.caption("Funziona sia con CR classico (con 'Dopo la battaglia...') sia con CR riassuntivo (tipo il primo che mi hai mandato).")
+
+with st.expander("🌐 Carica CR da API", expanded=False):
+    st.caption("Inserisci l'URL completo della API CR (ogame: /api/cr.xml?apiKey=...).")
+    api_url = st.text_input("URL API CR", placeholder="https://sXXX-it.ogame.gameforge.com/api/cr.xml?apiKey=...", key="api_url")
+    load_api = st.button("📥 Carica CR da API", use_container_width=True)
+    if load_api:
+        if not api_url.strip():
+            st.error("Inserisci un URL valido per la API CR.")
+        else:
+            try:
+                cr_text_api = fetch_cr_from_api(api_url.strip())
+                if not cr_text_api:
+                    st.error("Nessun CR trovato nella risposta API.")
+                else:
+                    st.session_state["cr_text"] = cr_text_api
+                    st.success("CR caricato dalla API. Ora puoi analizzarlo.")
+            except requests.RequestException as exc:
+                st.error(f"Errore durante la richiesta API: {exc}")
+            except Exception as exc:
+                st.error(f"Errore durante la lettura del CR: {exc}")
+
 cr_text = st.text_area("Combat Report", height=260, placeholder="Incolla qui il CR...", key="cr_text")
 
 colA, colB, colC = st.columns([1,1,2])
