@@ -1,718 +1,447 @@
+from __future__ import annotations
+
+import io
+import os
 import re
-import math
-import streamlit as st
-import pandas as pd
+from typing import Any, Dict, List, Tuple
 
-st.set_page_config(page_title="Spartizione Detriti (OGame)", layout="wide")
+import requests
+from flask import Flask, jsonify, render_template, request, send_file
+from openpyxl import load_workbook
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
 
-# --- Costi base (presi dal tuo Excel allegato) ---
-DEFAULT_COSTS = {
-    "Cargo. L": {"M": 2000, "C": 2000, "D": 0},
-    "Cargo. P": {"M": 6000, "C": 6000, "D": 0},
-    "Caccia. L": {"M": 3000, "C": 1000, "D": 0},
-    "Caccia. P": {"M": 6000, "C": 4000, "D": 0},
-    "Incrociatori": {"M": 20000, "C": 7000, "D": 2000},
-    "BS": {"M": 45000, "C": 15000, "D": 0},
-    "Bombardieri": {"M": 50000, "C": 25000, "D": 15000},
-    "Corazzate": {"M": 45000, "C": 15000, "D": 15000},
-    "Rip": {"M": 5000000, "C": 4000000, "D": 1000000},
-    "BC": {"M": 30000, "C": 40000, "D": 15000},
-    "Pathfinder": {"M": 8000, "C": 15000, "D": 8000},
-    "Reaper": {"M": 85000, "C": 55000, "D": 20000},
-    "Satelliti": {"M": 0, "C": 2000, "D": 500},
-    "Riciclatrici": {"M": 10000, "C": 6000, "D": 2000},
-    "Colonizzatrici": {"M": 10000, "C": 20000, "D": 10000},
-    "Sonde Spia": {"M": 0, "C": 1000, "D": 0},
-}
-SHIP_LIST = list(DEFAULT_COSTS.keys())
+APP_DIR = os.path.dirname(os.path.abspath(__file__))
+TEMPLATE_XLSX = os.path.join(APP_DIR, "template.xlsx")
 
-# --- Alias nomi navi (IT/EN) ---
-SHIP_ALIASES = {
-    # IT
-    "Cargo leggero": "Cargo. L",
-    "Cargo Leggero": "Cargo. L",
-    "Cargo pesante": "Cargo. P",
-    "Cargo Pesante": "Cargo. P",
-    "Caccia leggero": "Caccia. L",
-    "Caccia Leggero": "Caccia. L",
-    "Caccia pesante": "Caccia. P",
-    "Caccia Pesante": "Caccia. P",
-    "Incrociatore": "Incrociatori",
-    "Incrociatori": "Incrociatori",
-    "Nave da battaglia": "BS",
-    "Nave da Battaglia": "BS",
-    "Incrociatore da battaglia": "BC",
-    "Incrociatore da Battaglia": "BC",
-    "Bombardiere": "Bombardieri",
-    "Bombardieri": "Bombardieri",
-    "Corazzata": "Corazzate",
-    "Corazzate": "Corazzate",
-    "Morte Nera": "Rip",
-    "Riciclatrici": "Riciclatrici",
-    "Riciclatrice": "Riciclatrici",
-    "Colonizzatrice": "Colonizzatrici",
-    "Colonizzatrici": "Colonizzatrici",
-    "Sonda spia": "Sonde Spia",
-    "Sonda Spia": "Sonde Spia",
-    "Sonde spia": "Sonde Spia",
-    "Sonde Spia": "Sonde Spia",
-    "Satellite Solare": "Satelliti",
-    "Satellite solare": "Satelliti",
-    "Satelliti": "Satelliti",
-    "Reaper": "Reaper",
-    "Pathfinder": "Pathfinder",
+app = Flask(__name__)
 
-    # EN (se capita)
-    "Small Cargo": "Cargo. L",
-    "Large Cargo": "Cargo. P",
-    "Light Fighter": "Caccia. L",
-    "Heavy Fighter": "Caccia. P",
-    "Cruiser": "Incrociatori",
-    "Battleship": "BS",
-    "Battlecruiser": "BC",
-    "Bomber": "Bombardieri",
-    "Destroyer": "Corazzate",
-    "Deathstar": "Rip",
-    "Recycler": "Riciclatrici",
-    "Colony Ship": "Colonizzatrici",
-    "Espionage Probe": "Sonde Spia",
-    "Solar Satellite": "Satelliti",
-}
 
-def _parse_int(num_str: str) -> int:
-    s = (num_str or "").strip().replace(".", "").replace(",", "")
-    return int(s) if s else 0
+# -----------------------------
+# NoMoreAngel RAW parser
+# -----------------------------
+_KEYVAL_RE = re.compile(r"^\s*\[(.*?)\]\s*=>\s*(.*)$")
 
-def ship_total_cost(costs: dict, ship: str) -> float:
-    c = costs[ship]
-    return c["M"] + c["C"] + c["D"]
 
-def parse_cr(text: str):
-    """
-    Parser "robusto" per i due formati che mi hai incollato:
+def _parse_scalar(s: str) -> Any:
+    s = s.strip()
+    if s == "":
+        return None
+    if re.fullmatch(r"-?\d+", s):
+        try:
+            return int(s)
+        except Exception:
+            return s
+    if re.fullmatch(r"-?\d+\.\d+", s):
+        try:
+            return float(s)
+        except Exception:
+            return s
+    if s.lower() in ("true", "false"):
+        return s.lower() == "true"
+    return s
 
-    1) CR classico:
-       - blocchi "Attaccante <nick>" / "Difensore <nick>" con flotte iniziali
-       - sezione "Dopo la battaglia..." con flotte finali e perdite tra parentesi
-       - righe DF: "At these space coordinates now float ... metal, ... crystal and ... deuterium."
 
-    2) CR riassuntivo:
-       - righe del tipo: "Caccia Leggero 8.690.366 -782.497" (finale + delta)
-       - sezione "Tutti Attaccante" + "<nick> Difensore"
+def parse_print_r(text: str) -> Dict[str, Any]:
+    """Parse PHP print_r output (stdClass Object / Array nesting) into dict/list."""
+    lines = [ln.rstrip("\r") for ln in text.splitlines()]
+    root: Dict[str, Any] = {}
+    current: Any = root
+    stack: List[Any] = []
 
-    Ritorna:
-      fleets: {nick: {"initial":{ship:qty}, "final":{ship:qty}}}  (solo per navi in SHIP_LIST)
-      meta: {"df":{"M":..,"C":..,"D":..}, "loot":{"M":..,"C":..,"D":..}, "attacker_recycled_all": bool}
-    """
-    fleets = {}
-    meta = {"df": None, "loot": None, "attacker_recycled_all": False}
+    def set_in(container: Any, key: str, value: Any) -> None:
+        if isinstance(container, list):
+            # numeric indexes inside "Array"
+            try:
+                idx = int(key)
+            except Exception:
+                container.append({key: value})
+                return
+            while len(container) <= idx:
+                container.append(None)
+            container[idx] = value
+        else:
+            container[key] = value
 
-    if not text or not text.strip():
-        return fleets, meta
-
-    lines = [ln.rstrip() for ln in text.splitlines()]
-
-    # --- meta: DF e loot (dal CR classico) ---
-    df_pat = re.compile(r'now float\s+([\d\.,]+)\s+metal,\s+([\d\.,]+)\s+crystal\s+and\s+([\d\.,]+)\s+deuterium', re.IGNORECASE)
-    loot_pat = re.compile(r"L'attaccante\s+saccheggia:\s*([\d\.,]+)\s+Metallo,\s+([\d\.,]+)\s+Cristallo\s+e\s+([\d\.,]+)\s+Deuterio", re.IGNORECASE)
-    for ln in lines:
-        mdf = df_pat.search(ln)
-        if mdf:
-            meta["df"] = {"M": _parse_int(mdf.group(1)), "C": _parse_int(mdf.group(2)), "D": _parse_int(mdf.group(3))}
-        mloot = loot_pat.search(ln)
-        if mloot:
-            meta["loot"] = {"M": _parse_int(mloot.group(1)), "C": _parse_int(mloot.group(2)), "D": _parse_int(mloot.group(3))}
-        if "ha riciclato il campo detriti" in ln.lower():
-            meta["attacker_recycled_all"] = True
-
-    # --- helper: parse fleet block lines ---
-    # Iniziale (classico): "Caccia Leggero 3.226.909"
-    ship_line_init = re.compile(r'^\s*([A-Za-zÀ-ÿ\.\s]+?)\s+([\d\.,]+)\s*$')
-    # Finale (classico): "Caccia Leggero 2.961.733 ( -265.176 )"
-    ship_line_final = re.compile(r'^\s*([A-Za-zÀ-ÿ\.\s]+?)\s+([\d\.,]+)\s*\(\s*([+-]?[\d\.,]+)\s*\)\s*$')
-    # Riassuntivo: "Caccia Leggero 8.690.366 -782.497"
-    ship_line_summary = re.compile(r'^\s*([A-Za-zÀ-ÿ\.\s]+?)\s+([\d\.,]+)\s+(-|[+-][\d\.,]+)\s*$')
-
-    # Headers classico
-    hdr_att = re.compile(r'^\s*Attaccante\s+(.+?)\s*(?:\[|$)', re.IGNORECASE)
-    hdr_def = re.compile(r'^\s*Difensore\s+(.+?)\s*(?:\[|$)', re.IGNORECASE)
-
-    # Header riassuntivo
-    hdr_all_att = re.compile(r'^\s*Tutti\s+Attaccante\s*:?\s*$', re.IGNORECASE)
-    hdr_def_sum = re.compile(r'^\s*(.+?)\s+Difensore\s*:?\s*$', re.IGNORECASE)
-
-    # State machine: pre-battle vs after-battle
-    in_after = False
-
-    i = 0
-    while i < len(lines):
-        ln = lines[i].strip()
-
-        if ln.lower().startswith("dopo la battaglia"):
-            in_after = True
-            i += 1
+    for raw_line in lines:
+        line = raw_line.strip()
+        if not line or line == "...":
+            continue
+        if line in ("stdClass Object", "Array", "("):
+            continue
+        if line == ")":
+            if stack:
+                current = stack.pop()
             continue
 
-        # Decide which headers we are in
-        sec_name = None
-
-        mA = hdr_att.match(ln)
-        mD = hdr_def.match(ln)
-        if mA:
-            sec_name = mA.group(1).strip()
-        elif mD:
-            sec_name = mD.group(1).strip()
-
-        # Summary-style headers
-        if sec_name is None:
-            if hdr_all_att.match(ln):
-                sec_name = "Attaccanti (tutti)"
-            else:
-                mds = hdr_def_sum.match(ln)
-                if mds and "attaccante" not in ln.lower():  # evita prendere "Tutti Attaccante" qui
-                    raw = mds.group(1).strip()
-                    raw = raw.split(" di ")[0].strip()
-                    sec_name = raw
-
-        if sec_name is None:
-            i += 1
+        m = _KEYVAL_RE.match(raw_line)
+        if not m:
             continue
 
-        fleets.setdefault(sec_name, {"initial": {s:0 for s in SHIP_LIST}, "final": {s:0 for s in SHIP_LIST}})
-        i += 1
+        key = m.group(1)
+        val = m.group(2).strip()
 
-        # consume lines until next header or separator line
-        while i < len(lines):
-            cur = lines[i].strip()
+        if val in ("Array", "stdClass Object"):
+            new_container: Any = [] if val == "Array" else {}
+            set_in(current, key, new_container)
+            stack.append(current)
+            current = new_container
+        else:
+            set_in(current, key, _parse_scalar(val))
 
-            if cur.startswith("_____") or cur == "":
-                i += 1
-                continue
+    return root
 
-            if cur.lower().startswith("dopo la battaglia"):
-                break
 
-            # stop if next header
-            if hdr_att.match(cur) or hdr_def.match(cur) or hdr_all_att.match(cur) or hdr_def_sum.match(cur):
-                break
+def extract_print_r_from_html(html: str) -> str:
+    """Extract the RAW output block from the API-Reader page."""
+    # Most commonly it is inside <pre>...</pre>. Fallback: find 'stdClass Object'.
+    m = re.search(r"<pre[^>]*>([\s\S]*?)</pre>", html, re.IGNORECASE)
+    if m:
+        # unescape minimal HTML entities
+        block = m.group(1)
+        block = block.replace("&gt;", ">").replace("&lt;", "<").replace("&amp;", "&")
+        return block
 
-            # "Distrutto!"
-            if "distrutto" in cur.lower():
-                # final = 0 for everything; losses handled later if needed
-                i += 1
-                continue
+    idx = html.find("stdClass Object")
+    if idx >= 0:
+        return html[idx:]
 
-            # Parse summary line
-            ms = ship_line_summary.match(cur)
-            if ms and not in_after:
-                raw = re.sub(r'\s+', ' ', ms.group(1).strip())
-                final_qty = _parse_int(ms.group(2))
-                delta_raw = ms.group(3).strip()
-                loss_qty = 0
-                if delta_raw != "-" and delta_raw.startswith("-"):
-                    loss_qty = _parse_int(delta_raw[1:])
-                if raw in SHIP_ALIASES:
-                    ship = SHIP_ALIASES[raw]
-                    fleets[sec_name]["final"][ship] += final_qty
-                    fleets[sec_name]["initial"][ship] += final_qty + loss_qty
-                i += 1
-                continue
+    raise ValueError("RAW output not found in response")
 
-            # Parse final line (after-battle)
-            mf = ship_line_final.match(cur)
-            if mf and in_after:
-                raw = re.sub(r'\s+', ' ', mf.group(1).strip())
-                fin_qty = _parse_int(mf.group(2))
-                loss_qty = _parse_int(mf.group(3).replace("+","").replace("-",""))  # valore assoluto
-                if raw in SHIP_ALIASES:
-                    ship = SHIP_ALIASES[raw]
-                    fleets[sec_name]["final"][ship] += fin_qty
-                    fleets[sec_name]["initial"][ship] += fin_qty + loss_qty
-                i += 1
-                continue
 
-            # Parse initial line (pre-battle)
-            mi = ship_line_init.match(cur)
-            if mi and not in_after:
-                raw = re.sub(r'\s+', ' ', mi.group(1).strip())
-                qty = _parse_int(mi.group(2))
-                if raw in SHIP_ALIASES:
-                    ship = SHIP_ALIASES[raw]
-                    fleets[sec_name]["initial"][ship] += qty
-                i += 1
-                continue
+def fetch_nomor(raw_apiid: str) -> Dict[str, Any]:
+    """Fetch RAW output from NoMoreAngel API-Reader and parse it."""
+    url = "https://nomoreangel.de/api-reader/"
+    params = {
+        "apiid": raw_apiid,
+        "rawOut": "on",
+    }
+    r = requests.get(url, params=params, timeout=30)
+    r.raise_for_status()
+    raw_block = extract_print_r_from_html(r.text)
+    return parse_print_r(raw_block)
 
-            i += 1
 
-    # Se nel CR classico abbiamo anche i blocchi "Dopo la battaglia..." per lo stesso nick,
-    # il nostro parser aggiunge initial anche lì (fin+loss). Per evitare doppio conteggio:
-    # se esiste un initial "pre-battle" e un "after-battle", qui non possiamo distinguerli
-    # facilmente; ma nel classico, dopo-battaglia non va sommato al pre: va usato quello dopo.
-    # Quindi: se il testo contiene "Dopo la battaglia..." e per un nick abbiamo final>0 o losses,
-    # allora ricalcoliamo initial e final SOLO dal dopo-battaglia (già in initial = fin+loss),
-    # ma dobbiamo cancellare i valori pre-battle che erano stati messi.
-    #
-    # Soluzione: in questo parser, nel "dopo-battaglia" abbiamo popolato initial e final,
-    # mentre nel pre-battle solo initial. Se un nick ha final>0 in almeno una nave, assumiamo
-    # che quel nick sia stato trovato nella sezione dopo-battaglia e *ignora* l'initial pre-battle
-    # ricostruendo initial = final + perdite (già).
-    # Per farlo, serve riconoscere se abbiamo aggiunto fin in after. Lo facciamo: se final_sum>0
-    # e initial_sum>=final_sum => teniamo così e basta. Non possiamo rimuovere il pre aggiunto,
-    # quindi in pratica va bene solo se pre NON è stato aggiunto per lo stesso nick.
-    # Ma nel CR classico sì, viene aggiunto. Quindi aggiungiamo una seconda passata: estraiamo
-    # solo le flotte del dopo-battaglia con un parser dedicato e sovrascriviamo.
+# -----------------------------
+# Summarization / grouping
+# -----------------------------
+SHIP_TYPE_NAME = {
+    # Ships (common)
+    202: "Small Cargo",
+    203: "Large Cargo",
+    204: "Light Fighter",
+    205: "Heavy Fighter",
+    206: "Cruiser",
+    207: "Battleship",
+    208: "Colony Ship",
+    209: "Recycler",
+    210: "Espionage Probe",
+    211: "Bomber",
+    213: "Destroyer",
+    214: "Deathstar",
+    215: "Battlecruiser",
+    218: "Reaper",
+    219: "Pathfinder",
+}
 
-    if any("Dopo la battaglia" in ln for ln in lines):
-        fleets_after = {}
-        in_after = False
-        i = 0
-        while i < len(lines):
-            ln = lines[i].strip()
-            if ln.lower().startswith("dopo la battaglia"):
-                in_after = True
-                i += 1
-                continue
-            if not in_after:
-                i += 1
-                continue
 
-            mA = hdr_att.match(ln)
-            mD = hdr_def.match(ln)
-            if not (mA or mD):
-                i += 1
-                continue
-            nick = (mA.group(1) if mA else mD.group(1)).strip()
-            fleets_after.setdefault(nick, {"initial": {s:0 for s in SHIP_LIST}, "final": {s:0 for s in SHIP_LIST}})
-            i += 1
-            while i < len(lines):
-                cur = lines[i].strip()
-                if hdr_att.match(cur) or hdr_def.match(cur) or cur.lower().startswith("l'attaccante ha vinto") or cur.lower().startswith("l'attaccante/i"):
-                    break
-                if "distrutto" in cur.lower():
-                    i += 1
-                    break
-                mf = ship_line_final.match(cur)
-                if mf:
-                    raw = re.sub(r'\s+', ' ', mf.group(1).strip())
-                    fin_qty = _parse_int(mf.group(2))
-                    loss_qty = _parse_int(mf.group(3).replace("+","").replace("-",""))
-                    if raw in SHIP_ALIASES:
-                        ship = SHIP_ALIASES[raw]
-                        fleets_after[nick]["final"][ship] += fin_qty
-                        fleets_after[nick]["initial"][ship] += fin_qty + loss_qty
-                i += 1
+def summarize(parsed: Dict[str, Any]) -> Dict[str, Any]:
+    g = parsed.get("generic", {}) or {}
 
-        # Sovrascrivi i nick presenti nel dopo-battaglia (quelli affidabili)
-        for nick, data in fleets_after.items():
-            fleets[nick] = data
+    attackers: List[Dict[str, Any]] = [a for a in (parsed.get("attackers") or []) if isinstance(a, dict)]
 
-        # Defender distrutto: se presente blocco after con "Distrutto!" potrebbe aver lasciato initial=0.
-        # In quel caso, se abbiamo un initial pre-battle, calcoliamo final=0 e initial=pre.
-        for nick, data in list(fleets.items()):
-            if sum(data["final"].values()) == 0 and sum(data["initial"].values()) == 0:
-                # prova a recuperare pre-battle
-                pass
+    # Unique players + first seen tag
+    tag_map: Dict[str, str] = {}
+    for a in attackers:
+        name = a.get("fleet_owner")
+        if not name:
+            continue
+        if name not in tag_map:
+            tag_map[name] = a.get("fleet_owner_alliance_tag") or ""
 
-    return fleets, meta
+    players = sorted(tag_map.keys())
 
-st.title("Spartizione detriti (OGame) — logica come l'Excel")
+    return {
+        "generic": {
+            "cr_id": g.get("cr_id"),
+            "event_time": g.get("event_time"),
+            "combat_coordinates": g.get("combat_coordinates"),
+            "combat_rounds": g.get("combat_rounds"),
+            "winner": g.get("winner"),
+            "moon_chance": g.get("moon_chance"),
+            "loot_percentage": g.get("loot_percentage"),
+            "loot_metal": g.get("loot_metal"),
+            "loot_crystal": g.get("loot_crystal"),
+            "loot_deuterium": g.get("loot_deuterium"),
+            "units_lost_attackers": g.get("units_lost_attackers"),
+            "units_lost_defenders": g.get("units_lost_defenders"),
+            "debris_metal": g.get("debris_metal"),
+            "debris_crystal": g.get("debris_crystal"),
+            "debris_deuterium": g.get("debris_deuterium"),
+            "wreck_metal": g.get("wreckfield_metal"),
+            "wreck_crystal": g.get("wreckfield_crystal"),
+            "wreck_deuterium": g.get("wreckfield_deuterium"),
+        },
+        "attackers": [{"name": p, "tag": tag_map.get(p, "")} for p in players],
+    }
 
-with st.expander("🔧 Impostazioni", expanded=True):
-    col1, col2, col3 = st.columns([1,1,2])
-    with col1:
-        n_players = st.number_input("Numero giocatori (ACS)", min_value=1, max_value=5, value=2, step=1)
-    with col2:
-        debris_factor = st.number_input("Fattore detriti (nave → DF)", min_value=0.0, max_value=1.0, value=0.70, step=0.01)
-    with col3:
-        st.caption(
-            "Logica 'ibrida' del foglio: **compensazione perdite + quota a peso della flotta in campo**, "
-            "meno quanto ciascuno ha già riciclato."
+
+# -----------------------------
+# Spreadsheet generation
+# -----------------------------
+
+def build_workbook(summary: Dict[str, Any], weights: Dict[str, float] | None = None) -> io.BytesIO:
+    if not os.path.exists(TEMPLATE_XLSX):
+        raise FileNotFoundError(
+            "template.xlsx not found. Put your template in the app folder as template.xlsx"
         )
 
-st.divider()
+    wb = load_workbook(TEMPLATE_XLSX)
 
-# --- Giocatori ---
-st.subheader("1) Giocatori")
-player_cols = st.columns(int(n_players))
-players = []
-for i in range(int(n_players)):
-    with player_cols[i]:
-        nick = st.text_input(f"Nick giocatore {i+1}", value=f"Player {i+1}", key=f"nick_{i}")
-        players.append(nick)
+    # Create/overwrite the Report sheet
+    if "Report" in wb.sheetnames:
+        del wb["Report"]
+    ws = wb.create_sheet("Report", 0)
 
-# --- CR Paste helper ---
-st.subheader("0) (Opzionale) Incolla Combat Report per auto-compilare")
-st.caption("Funziona sia con CR classico (con 'Dopo la battaglia...') sia con CR riassuntivo (tipo il primo che mi hai mandato).")
-cr_text = st.text_area("Combat Report", height=260, placeholder="Incolla qui il CR...", key="cr_text")
+    g = summary["generic"]
+    attackers = summary["attackers"]
+    weights = weights or {a["name"]: 1.0 for a in attackers}
 
-colA, colB, colC = st.columns([1,1,2])
-with colA:
-    parse_btn = st.button("🔍 Analizza CR", use_container_width=True)
-with colB:
-    apply_btn = st.button("✅ Applica ai giocatori (match per nick)", use_container_width=True)
-with colC:
-    st.caption("Tip: se i nick nel CR combaciano con quelli inseriti sopra, l’app compila tutto in automatico.")
+    # Styles
+    header_fill = PatternFill("solid", fgColor="1F2937")
+    white = Font(color="FFFFFF", bold=True)
+    bold = Font(bold=True, color="111827")
+    center = Alignment(horizontal="center", vertical="center")
+    left = Alignment(horizontal="left", vertical="center")
+    right = Alignment(horizontal="right", vertical="center")
+    wrap = Alignment(wrap_text=True, vertical="top")
+    thin = Side(style="thin", color="CBD5E1")
+    med = Side(style="medium", color="64748B")
+    grid = Border(left=thin, right=thin, top=thin, bottom=thin)
 
-if parse_btn:
-    fleets, meta = parse_cr(cr_text)
-    st.session_state["cr_fleets"] = fleets
-    st.session_state["cr_meta"] = meta
+    # Column widths
+    for col, w in {1: 24, 2: 22, 3: 20, 4: 18, 5: 18, 6: 18, 7: 18, 8: 18}.items():
+        ws.column_dimensions[get_column_letter(col)].width = w
 
-fleets = st.session_state.get("cr_fleets", {})
-meta = st.session_state.get("cr_meta", {})
+    # Title
+    ws.merge_cells("A1:H1")
+    ws["A1"] = "OGame – Spartizione Detriti (NoMoreAngel API Reader)"
+    ws["A1"].font = Font(color="FFFFFF", bold=True, size=14)
+    ws["A1"].fill = header_fill
+    ws["A1"].alignment = center
+    ws.row_dimensions[1].height = 28
 
-if fleets:
-    with st.expander("🧾 Dettagli estratti dal CR", expanded=True):
-        st.write("Nick trovati:", ", ".join(fleets.keys()))
-        if meta and meta.get("df"):
-            st.write("DF trovato (metal/crystal/deut):", meta["df"])
-        if meta and meta.get("loot"):
-            st.write("Bottino (metal/crystal/deut):", meta["loot"])
-        if meta and meta.get("attacker_recycled_all"):
-            st.info("Nel CR risulta che gli attaccanti hanno riciclato il campo detriti.")
+    # Metadata
+    ws["A2"] = "Dettagli"
+    ws["A2"].font = Font(bold=True, color="374151")
 
-        # Opzione: distribuire DF totale sui ricicli (utile quando il CR non dice chi ha riciclato cosa)
-        if meta and meta.get("df"):
-            st.markdown("**Auto-compila riciclo totale (opzionale)**")
-            mode = st.selectbox(
-                "Come vuoi assegnare il DF riciclato?",
-                ["Non compilare automaticamente", "Assegna tutto a un giocatore", "Dividi per quota peso (flotta in campo)"],
-                index=0,
-                key="df_mode",
-            )
-            collector = None
-            if mode == "Assegna tutto a un giocatore":
-                collector = st.selectbox("Giocatore che ha riciclato", players, key="df_collector")
-            st.caption("Nota: verrà compilato nel riquadro Riciclo → 'Riciclatrici' (non distingue Reaper).")
+    meta = [
+        ("CR-ID", g.get("cr_id")),
+        ("Data/Ora", g.get("event_time")),
+        ("Coordinate", g.get("combat_coordinates")),
+        ("Round", g.get("combat_rounds")),
+        ("Vincitore", g.get("winner")),
+        ("Moon chance", (g.get("moon_chance") or 0) / 100),
+        ("Loot %", (g.get("loot_percentage") or 0) / 100),
+    ]
 
-if apply_btn and fleets:
-    applied = 0
-    # Applica flotta in campo e perdite ai giocatori con nick combaciante (case-insensitive)
-    for p in players:
-        match = None
-        for k in fleets.keys():
-            if k.lower() == p.lower():
-                match = k
-                break
-        if not match:
+    start_row = 3
+    for i, (k, v) in enumerate(meta):
+        r = start_row + i
+        ws[f"A{r}"] = k
+        ws[f"A{r}"].font = bold
+        ws[f"A{r}"].alignment = left
+        ws[f"B{r}"] = v
+        ws[f"B{r}"].alignment = left
+        ws[f"A{r}"].border = grid
+        ws[f"B{r}"].border = grid
+
+    ws["B8"].number_format = "0.0%"  # moon
+    ws["B9"].number_format = "0.0%"  # loot
+
+    # Resource summary
+    ws["D2"] = "Riepilogo risorse"
+    ws["D2"].font = Font(bold=True, color="374151")
+
+    def _num(x: Any) -> Any:
+        return x if x is not None else "n/d"
+
+    summary_rows = [
+        ("Loot Metal", _num(g.get("loot_metal"))),
+        ("Loot Crystal", _num(g.get("loot_crystal"))),
+        ("Loot Deuterium", _num(g.get("loot_deuterium"))),
+        ("Loot Totale", "=SUM(D3:D5)"),
+        ("Perdite Attaccanti", _num(g.get("units_lost_attackers"))),
+        ("Perdite Difensore", _num(g.get("units_lost_defenders"))),
+        ("Debris Metal", _num(g.get("debris_metal"))),
+        ("Debris Crystal", _num(g.get("debris_crystal"))),
+        ("Debris Deuterium", _num(g.get("debris_deuterium"))),
+        ("Debris Totale", "=SUM(D9:D11)"),
+        ("Wreck Metal (Def)", _num(g.get("wreck_metal"))),
+        ("Wreck Crystal (Def)", _num(g.get("wreck_crystal"))),
+        ("Wreck Deuterium (Def)", _num(g.get("wreck_deuterium"))),
+        ("Wreck Totale", "=IF(OR(D13=\"n/d\",D14=\"n/d\",D15=\"n/d\"),\"n/d\",SUM(D13:D15))"),
+    ]
+
+    r0 = 3
+    for i, (k, v) in enumerate(summary_rows):
+        r = r0 + i
+        ws[f"C{r}"] = k
+        ws[f"C{r}"].font = bold
+        ws[f"C{r}"].alignment = left
+        ws[f"D{r}"] = v
+        ws[f"D{r}"].alignment = right
+        ws[f"C{r}"].border = grid
+        ws[f"D{r}"].border = grid
+        if isinstance(v, (int, float)):
+            ws[f"D{r}"].number_format = "#,##0"
+
+    # Attacker split
+    ws["A12"] = "Attaccanti (pesi modificabili)"
+    ws["A12"].font = Font(bold=True, color="374151")
+
+    table_start = 13
+    headers = ["Giocatore", "TAG", "Peso", "% quota", "DF Metal", "DF Crystal", "DF Deut", "DF Totale"]
+    for j, h in enumerate(headers, start=1):
+        cell = ws.cell(table_start, j, h)
+        cell.font = white
+        cell.fill = header_fill
+        cell.alignment = center
+        cell.border = grid
+
+    # Write attacker rows
+    first_row = table_start + 1
+    for i, a in enumerate(attackers):
+        r = first_row + i
+        name = a["name"]
+        ws[f"A{r}"] = name
+        ws[f"B{r}"] = a.get("tag", "")
+        ws[f"C{r}"] = float(weights.get(name, 1.0))
+        ws[f"D{r}"] = f"=C{r}/SUM($C${first_row}:$C${first_row + len(attackers) - 1})"
+
+        # Base values are in D9/D10/D11
+        ws[f"E{r}"] = f"=ROUND($D$9*D{r},0)"
+        ws[f"F{r}"] = f"=ROUND($D$10*D{r},0)"
+        ws[f"G{r}"] = f"=ROUND($D$11*D{r},0)"
+        ws[f"H{r}"] = f"=E{r}+F{r}+G{r}"
+
+        for col in "ABCDEFGH":
+            ws[f"{col}{r}"].border = grid
+            ws[f"{col}{r}"].alignment = right if col in "CDEFGH" else left
+
+        ws[f"D{r}"].number_format = "0.00%"
+        for col in "EFGH":
+            ws[f"{col}{r}"].number_format = "#,##0"
+
+    # Fix rounding drift: last row becomes remainder
+    if attackers:
+        last_r = first_row + len(attackers) - 1
+        ws[f"E{last_r}"] = f"=$D$9-SUM(E{first_row}:E{last_r-1})"
+        ws[f"F{last_r}"] = f"=$D$10-SUM(F{first_row}:F{last_r-1})"
+        ws[f"G{last_r}"] = f"=$D$11-SUM(G{first_row}:G{last_r-1})"
+        ws[f"H{last_r}"] = f"=E{last_r}+F{last_r}+G{last_r}"
+
+    # Totals row
+    tot_r = first_row + len(attackers)
+    ws[f"A{tot_r}"] = "Totale"
+    ws[f"D{tot_r}"] = f"=SUM(D{first_row}:D{tot_r-1})"
+    ws[f"E{tot_r}"] = f"=SUM(E{first_row}:E{tot_r-1})"
+    ws[f"F{tot_r}"] = f"=SUM(F{first_row}:F{tot_r-1})"
+    ws[f"G{tot_r}"] = f"=SUM(G{first_row}:G{tot_r-1})"
+    ws[f"H{tot_r}"] = f"=SUM(H{first_row}:H{tot_r-1})"
+
+    for col in "ABCDEFGH":
+        c = ws[f"{col}{tot_r}"]
+        c.border = Border(left=med, right=med, top=med, bottom=med)
+        c.fill = PatternFill("solid", fgColor="F3F4F6")
+        c.alignment = right if col in "CDEFGH" else left
+
+    ws[f"D{tot_r}"].number_format = "0.00%"
+    for col in "EFGH":
+        ws[f"{col}{tot_r}"].number_format = "#,##0"
+
+    # Note
+    note_row = tot_r + 3
+    ws.merge_cells(f"A{note_row}:H{note_row+2}")
+    ws[f"A{note_row}"] = (
+        "Dati letti dal RAW di NoMoreAngel API-Reader. Modifica i pesi in colonna C per cambiare la spartizione."
+    )
+    ws[f"A{note_row}"].alignment = wrap
+    ws[f"A{note_row}"].font = Font(color="374151", size=10)
+
+    ws.freeze_panes = "A13"
+
+    # Save to memory
+    bio = io.BytesIO()
+    wb.save(bio)
+    bio.seek(0)
+    return bio
+
+
+# -----------------------------
+# Routes
+# -----------------------------
+
+def _parse_weights(raw: str) -> Dict[str, float]:
+    """Parse 'Name=1, Other=2' into dict."""
+    out: Dict[str, float] = {}
+    raw = (raw or "").strip()
+    if not raw:
+        return out
+    for part in raw.split(","):
+        if "=" not in part:
             continue
-
-        init = fleets[match]["initial"]
-        fin = fleets[match]["final"]
-
-        for ship in SHIP_LIST:
-            st.session_state[f"field_{p}_{ship}"] = int(init.get(ship, 0))
-            lost_qty = max(int(init.get(ship, 0)) - int(fin.get(ship, 0)), 0)
-            if lost_qty > 0:
-                st.session_state[f"lost_{p}_{ship}"] = int(lost_qty)
-
-        applied += 1
-
-    # Se scelto, compila anche riciclo DF
-    if meta and meta.get("df"):
-        mode = st.session_state.get("df_mode", "Non compilare automaticamente")
-        if mode == "Assegna tutto a un giocatore":
-            collector = st.session_state.get("df_collector")
-            if collector:
-                st.session_state[f"recM_rec_{collector}"] = int(meta["df"]["M"])
-                st.session_state[f"recC_rec_{collector}"] = int(meta["df"]["C"])
-                st.session_state[f"recD_rec_{collector}"] = int(meta["df"]["D"])
-        elif mode == "Dividi per quota peso (flotta in campo)":
-            # Calcola pesi usando COSTS default (basta per ripartizione; si può rifare dopo anche se modifichi costi)
-            def weight_from_init(player_name):
-                w = 0.0
-                # usa init fleet del CR se esiste
-                for k in fleets.keys():
-                    if k.lower() == player_name.lower():
-                        init = fleets[k]["initial"]
-                        for ship in SHIP_LIST:
-                            c = DEFAULT_COSTS[ship]
-                            w += float(init.get(ship, 0)) * (c["M"] + c["C"] + c["D"])
-                return w
-
-            weights = {p: weight_from_init(p) for p in players}
-            tot = sum(weights.values())
-            if tot > 0:
-                for p in players:
-                    share = weights[p] / tot
-                    st.session_state[f"recM_rec_{p}"] = int(round(meta["df"]["M"] * share))
-                    st.session_state[f"recC_rec_{p}"] = int(round(meta["df"]["C"] * share))
-                    st.session_state[f"recD_rec_{p}"] = int(round(meta["df"]["D"] * share))
-
-    if applied == 0:
-        st.warning("Nessun nick del CR combacia con i giocatori inseriti sopra. Rinomina i giocatori (anche solo maiuscole/minuscole) e riprova.")
-    else:
-        st.success(f"Auto-compilazione applicata a {applied} giocatori (match per nick).")
-
-st.divider()
-
-# --- Costi modificabili (opzionale) ---
-with st.expander("💰 Tabella costi (modificabile)", expanded=False):
-    costs_df = pd.DataFrame(
-        [{"Nave": s, "M": DEFAULT_COSTS[s]["M"], "C": DEFAULT_COSTS[s]["C"], "D": DEFAULT_COSTS[s]["D"]} for s in SHIP_LIST]
-    )
-    edited = st.data_editor(costs_df, use_container_width=True, num_rows="fixed", key="costs_editor")
-    COSTS = {row["Nave"]: {"M": float(row["M"]), "C": float(row["C"]), "D": float(row["D"])} for _, row in edited.iterrows()}
-
-# --- Input flotte perse ---
-st.subheader("2) Flotta persa (per giocatore)")
-lost = {p: {s: 0 for s in SHIP_LIST} for p in players}
-lost_tabs = st.tabs(players)
-for p, tab in zip(players, lost_tabs):
-    with tab:
-        cols = st.columns(4)
-        for idx, ship in enumerate(SHIP_LIST):
-            with cols[idx % 4]:
-                lost[p][ship] = st.number_input(
-                    f"{ship}",
-                    min_value=0,
-                    value=int(st.session_state.get(f"lost_{p}_{ship}", 0)),
-                    step=1,
-                    key=f"lost_{p}_{ship}",
-                )
-
-# --- Input flotta in campo ---
-st.subheader("3) Flotta in campo (per il peso)")
-in_field = {p: {s: 0 for s in SHIP_LIST} for p in players}
-field_tabs = st.tabs(players)
-for p, tab in zip(players, field_tabs):
-    with tab:
-        cols = st.columns(4)
-        for idx, ship in enumerate(SHIP_LIST):
-            with cols[idx % 4]:
-                in_field[p][ship] = st.number_input(
-                    f"{ship}",
-                    min_value=0,
-                    value=int(st.session_state.get(f"field_{p}_{ship}", 0)),
-                    step=1,
-                    key=f"field_{p}_{ship}",
-                )
-
-# --- Input riciclo (riciclatrici + reaper) ---
-st.subheader("4) Riciclo per giocatore")
-recycle = {p: {"M": {"Riciclatrici": 0, "Reaper": 0},
-              "C": {"Riciclatrici": 0, "Reaper": 0},
-              "D": {"Riciclatrici": 0, "Reaper": 0}} for p in players}
-
-rec_tabs = st.tabs(players)
-for p, tab in zip(players, rec_tabs):
-    with tab:
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.markdown("**Metallo (M)**")
-            recycle[p]["M"]["Riciclatrici"] = st.number_input("Riciclatrici", min_value=0, value=int(st.session_state.get(f"recM_rec_{p}", 0)), step=1, key=f"recM_rec_{p}")
-            recycle[p]["M"]["Reaper"] = st.number_input("Reaper", min_value=0, value=int(st.session_state.get(f"recM_rea_{p}", 0)), step=1, key=f"recM_rea_{p}")
-        with c2:
-            st.markdown("**Cristallo (C)**")
-            recycle[p]["C"]["Riciclatrici"] = st.number_input("Riciclatrici ", min_value=0, value=int(st.session_state.get(f"recC_rec_{p}", 0)), step=1, key=f"recC_rec_{p}")
-            recycle[p]["C"]["Reaper"] = st.number_input("Reaper ", min_value=0, value=int(st.session_state.get(f"recC_rea_{p}", 0)), step=1, key=f"recC_rea_{p}")
-        with c3:
-            st.markdown("**Deuterio (D)**")
-            recycle[p]["D"]["Riciclatrici"] = st.number_input("Riciclatrici  ", min_value=0, value=int(st.session_state.get(f"recD_rec_{p}", 0)), step=1, key=f"recD_rec_{p}")
-            recycle[p]["D"]["Reaper"] = st.number_input("Reaper  ", min_value=0, value=int(st.session_state.get(f"recD_rea_{p}", 0)), step=1, key=f"recD_rea_{p}")
-
-st.divider()
-
-# --- Calcoli ---
-lost_res = {p: {"M": 0.0, "C": 0.0, "D": 0.0} for p in players}
-for p in players:
-    for ship in SHIP_LIST:
-        qty = float(lost[p][ship] or 0)
-        c = COSTS[ship]
-        lost_res[p]["M"] += qty * c["M"]
-        lost_res[p]["C"] += qty * c["C"]
-        lost_res[p]["D"] += qty * c["D"]
-
-weights = {p: 0.0 for p in players}
-for p in players:
-    for ship in SHIP_LIST:
-        qty = float(in_field[p][ship] or 0)
-        weights[p] += qty * ship_total_cost(COSTS, ship)
-
-total_weight = sum(weights.values())
-shares = {p: (weights[p] / total_weight if total_weight > 0 else 0.0) for p in players}
-
-recycled = {p: {"M": 0.0, "C": 0.0, "D": 0.0} for p in players}
-for p in players:
-    for r in ["M","C","D"]:
-        recycled[p][r] = float(recycle[p][r]["Riciclatrici"] or 0) + float(recycle[p][r]["Reaper"] or 0)
-
-lost_total = {r: sum(lost_res[p][r] for p in players) for r in ["M","C","D"]}
-recycled_total = {r: sum(recycled[p][r] for p in players) for r in ["M","C","D"]}
-
-gain = {r: recycled_total[r] - lost_total[r] for r in ["M","C","D"]}
-
-due_hybrid = {p: {r: (gain[r] * shares[p]) + lost_res[p][r] - recycled[p][r] for r in ["M","C","D"]} for p in players}
+        k, v = part.split("=", 1)
+        k = k.strip()
+        try:
+            out[k] = float(v.strip())
+        except Exception:
+            continue
+    return out
 
 
-# --- Trasporti necessari per la ridistribuzione ---
-st.subheader("5) Trasporti necessari (post-raccolta)")
-st.caption("Calcolo dei carichi necessari per trasferire le risorse tra i giocatori in base alla spartizione finale.")
-
-with st.expander("🚚 Impostazioni trasporti", expanded=True):
-    colA, colB = st.columns(2)
-    with colA:
-        cargo_type = st.selectbox(
-            "Tipo di nave da trasporto",
-            ["Cargo Leggero (5.000)", "Cargo Pesante (25.000)"],
-            index=1,
-        )
-    with colB:
-        st.caption("Capacità standard OGame, senza bonus tecnologia.")
-
-cargo_capacity = 5000 if "Leggero" in cargo_type else 25000
-
-# Calcolo risorse nette per giocatore
-net = {p: {r: round(due_hybrid[p][r]) for r in ["M","C","D"]} for p in players}
-
-# Totale da spedire per chi deve dare (valori negativi)
-rows_t = []
-for p in players:
-    give = sum(-v for v in net[p].values() if v < 0)
-    receive = sum(v for v in net[p].values() if v > 0)
-    ships_needed = math.ceil(max(give, receive) / cargo_capacity) if max(give, receive) > 0 else 0
-    rows_t.append({
-        "Giocatore": p,
-        "Deve dare (tot risorse)": give,
-        "Deve ricevere (tot risorse)": receive,
-        "Capacità nave": cargo_capacity,
-        "Trasporti minimi": ships_needed,
-    })
-
-transport_df = pd.DataFrame(rows_t)
-
-st.dataframe(transport_df, use_container_width=True)
-st.caption("Nota: il numero di trasporti è una stima minima (carichi ottimizzati, senza vuoti).")
+@app.get("/")
+def index():
+    return render_template("index.html")
 
 
-st.subheader("Risultati")
+@app.post("/preview")
+def preview():
+    apiid = request.form.get("apiid", "").strip()
+    weights = _parse_weights(request.form.get("weights", ""))
+    parsed = fetch_nomor(apiid)
+    summ = summarize(parsed)
+    return render_template("report.html", data=summ, weights=weights)
 
-rows = []
-for p in players:
-    rows.append({
-        "Giocatore": p,
-        "Peso flotta": round(weights[p]),
-        "Quota peso": shares[p],
-        "Perdite M": round(lost_res[p]["M"]),
-        "Perdite C": round(lost_res[p]["C"]),
-        "Perdite D": round(lost_res[p]["D"]),
-        "Riciclato M": round(recycled[p]["M"]),
-        "Riciclato C": round(recycled[p]["C"]),
-        "Riciclato D": round(recycled[p]["D"]),
-        "Ibrida: M dovuto(+) / da dare(-)": round(due_hybrid[p]["M"]),
-        "Ibrida: C dovuto(+) / da dare(-)": round(due_hybrid[p]["C"]),
-        "Ibrida: D dovuto(+) / da dare(-)": round(due_hybrid[p]["D"]),
-    })
-out_df = pd.DataFrame(rows)
 
-c1, c2 = st.columns([2,1])
-with c1:
-    st.dataframe(out_df, use_container_width=True)
-with c2:
-    st.markdown("**Totali**")
-    st.write({
-        "Perdite": {k: round(v) for k,v in lost_total.items()},
-        "Riciclato": {k: round(v) for k,v in recycled_total.items()},
-        "Gain da dividere": {k: round(v) for k,v in gain.items()},
-    })
+@app.get("/api/json")
+def api_json():
+    apiid = request.args.get("apiid", "").strip()
+    parsed = fetch_nomor(apiid)
+    summ = summarize(parsed)
+    return jsonify(summ)
 
-st.caption("Interpretazione: valori **positivi** in 'Ibrida' = risorse che il giocatore deve ricevere; valori **negativi** = risorse che deve trasferire agli altri.")
 
-# ----------------------------
-# Trasferimenti consigliati (per ridistribuire dopo le raccolte)
-# ----------------------------
-def settle_transactions(amounts_by_player: dict):
-    """
-    amounts_by_player: {player: amount} dove:
-      >0 = deve ricevere
-      <0 = deve dare
-    Ritorna lista transazioni: (da, a, amount)
-    """
-    eps = 0.5  # tolleranza arrotondamenti
-    creditors = [(p, v) for p, v in amounts_by_player.items() if v > eps]
-    debtors = [(p, -v) for p, v in amounts_by_player.items() if v < -eps]  # amount to pay (positive)
-    creditors.sort(key=lambda x: x[1], reverse=True)
-    debtors.sort(key=lambda x: x[1], reverse=True)
+@app.get("/download/xlsx")
+def download_xlsx():
+    apiid = request.args.get("apiid", "").strip()
+    weights = _parse_weights(request.args.get("weights", ""))
+    parsed = fetch_nomor(apiid)
+    summ = summarize(parsed)
 
-    tx = []
-    i = j = 0
-    while i < len(debtors) and j < len(creditors):
-        dp, damt = debtors[i]
-        cp, camt = creditors[j]
-        send = min(damt, camt)
-        if send > eps:
-            tx.append((dp, cp, send))
-        damt -= send
-        camt -= send
-        debtors[i] = (dp, damt)
-        creditors[j] = (cp, camt)
-        if damt <= eps:
-            i += 1
-        if camt <= eps:
-            j += 1
-    return tx
+    # ensure every player has a weight
+    for a in summ["attackers"]:
+        weights.setdefault(a["name"], 1.0)
 
-def ceil_div(a, b):
-    return int(math.ceil(a / b)) if b > 0 else 0
-
-with st.expander("🚚 Trasporti necessari per ridistribuire (calcolati dai saldi Ibridi)", expanded=True):
-    st.caption(
-        "Calcolo automatico dei **trasferimenti** tra membri per azzerare i saldi. "
-        "Le transazioni sono calcolate separatamente per M/C/D e poi aggregate per coppia (da→a)."
+    bio = build_workbook(summ, weights=weights)
+    filename = f"Spartizione_Detriti_{apiid}.xlsx".replace(":", "_")
+    return send_file(
+        bio,
+        as_attachment=True,
+        download_name=filename,
+        mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
-    cap_choice = st.selectbox(
-        "Tipo trasporto per stimare le navi necessarie",
-        ["Cargo. L (5.000)", "Cargo. P (25.000)"],
-        index=1,
-    )
-    capacity = 5000 if "5.000" in cap_choice else 25000
 
-    # Transazioni per risorsa
-    tx_by_res = {}
-    for r in ["M", "C", "D"]:
-        amounts = {p: float(due_hybrid[p][r]) for p in players}
-        tx_by_res[r] = settle_transactions(amounts)
-
-    # Aggrega per coppia (da,a)
-    agg = {}
-    for r in ["M", "C", "D"]:
-        for frm, to, amt in tx_by_res[r]:
-            key = (frm, to)
-            agg.setdefault(key, {"M": 0.0, "C": 0.0, "D": 0.0})
-            agg[key][r] += amt
-
-    # Tabella finale
-    tx_rows = []
-    for (frm, to), v in agg.items():
-        total_payload = v["M"] + v["C"] + v["D"]
-        ships = ceil_div(total_payload, capacity)
-        tx_rows.append({
-            "Da": frm,
-            "A": to,
-            "Metallo": int(round(v["M"])),
-            "Cristallo": int(round(v["C"])),
-            "Deuterio": int(round(v["D"])),
-            "Totale carico": int(round(total_payload)),
-            f"N° {cap_choice.split()[0]}": ships,
-        })
-    tx_df = pd.DataFrame(tx_rows).sort_values(["Da","A"]) if tx_rows else pd.DataFrame(columns=["Da","A","Metallo","Cristallo","Deuterio","Totale carico", f"N° {cap_choice.split()[0]}"])
-
-    if tx_df.empty:
-        st.info("Non risultano trasferimenti (tutti i saldi sono ~0).")
-    else:
-        st.dataframe(tx_df, use_container_width=True)
-
-        # Dettaglio per risorsa (opzionale)
-        with st.expander("Dettaglio transazioni per singola risorsa", expanded=False):
-            for r, label in [("M","Metallo"),("C","Cristallo"),("D","Deuterio")]:
-                st.markdown(f"**{label}**")
-                rows_r = [{"Da": a, "A": b, label: int(round(v))} for a,b,v in tx_by_res[r]]
-                st.dataframe(pd.DataFrame(rows_r) if rows_r else pd.DataFrame(columns=["Da","A",label]), use_container_width=True)
-
-        csv_tx = tx_df.to_csv(index=False).encode("utf-8")
-        st.download_button("⬇️ Scarica trasporti (CSV)", data=csv_tx, file_name="trasporti_ridistribuzione.csv", mime="text/csv")
-
-# Export CSV risultati
-csv = out_df.to_csv(index=False).encode("utf-8")
-st.download_button("⬇️ Scarica risultati (CSV)", data=csv, file_name="spartizione_detriti_risultati.csv", mime="text/csv")
+if __name__ == "__main__":
+    app.run(host="127.0.0.1", port=5000, debug=True)
